@@ -1,3 +1,5 @@
+"use strict";
+
 const axios = require("axios");
 const FormData = require("form-data");
 
@@ -10,14 +12,35 @@ let bold = null;
 let devices = new Map();
 let refreshTimer = null;
 
-function createBoldAPI(cfg, log) {
+/**
+ * Resolve access + refresh tokens from OAuth SDK first, then fall back to config.
+ * AUTH-01: OAuth tokens are injected by the hub and accessed via api.getOAuthToken().
+ */
+function resolveTokens(cfg, api) {
+  // Try OAuth tokens from hub-injected SDK first (AUTH-01)
+  const oauth = typeof api.getOAuthToken === "function" ? api.getOAuthToken() : null;
+  if (oauth && oauth.access_token) {
+    return {
+      accessToken: oauth.access_token,
+      refreshToken: oauth.refresh_token || cfg.refreshToken,
+    };
+  }
+  // Fall back to manually configured tokens
+  return {
+    accessToken: cfg.accessToken,
+    refreshToken: cfg.refreshToken,
+  };
+}
+
+function createBoldAPI(cfg, api) {
   async function req(method, endpoint, body, headers) {
+    const tokens = resolveTokens(cfg, api);
     try {
       const resp = await axios.request({
         method,
         url: `${API_BASE}${endpoint}`,
         headers: {
-          Authorization: `Bearer ${cfg.accessToken}`,
+          Authorization: `Bearer ${tokens.accessToken}`,
           "Content-Type": "application/json",
           ...headers,
         },
@@ -36,7 +59,7 @@ function createBoldAPI(cfg, log) {
   }
 
   async function getDevices() {
-    log("debug", "Fetching Bold devices...");
+    api.log("debug", "Fetching Bold devices...");
     const resp = await req("GET", "/v1/effective-device-permissions");
     if (!resp.success) throw new Error(`getDevices: ${resp.error.message}`);
     if (!Array.isArray(resp.data)) throw new Error("Unexpected /v1/effective-device-permissions format");
@@ -44,11 +67,11 @@ function createBoldAPI(cfg, log) {
   }
 
   async function activate(deviceId) {
-    log("debug", `Activating ${deviceId}...`);
+    api.log("debug", `Activating ${deviceId}...`);
     const resp = await req("POST", `/v1/devices/${deviceId}/remote-activation`);
     if (!resp.success && resp.error.code == 401) {
-      log("warn", "Token expired on activation; refreshing...");
-      const tokens = await refresh();
+      api.log("warn", "Token expired on activation; refreshing...");
+      const tokens = await refresh(cfg, api);
       if (tokens) {
         cfg.accessToken = tokens.accessToken;
         cfg.refreshToken = tokens.refreshToken;
@@ -57,48 +80,50 @@ function createBoldAPI(cfg, log) {
       return false;
     }
     if (!resp.success) {
-      log("error", `Activation failed for ${deviceId}: ${resp.error.message}`);
+      api.log("error", `Activation failed for ${deviceId}: ${resp.error.message}`);
       return false;
     }
     return true;
   }
 
-  async function refresh() {
-    log("debug", "Refreshing Bold access token...");
-    if (cfg.legacyAuthentication) {
-      const fd = new FormData();
-      fd.append("client_id", LEGACY_CLIENT_ID);
-      fd.append("client_secret", LEGACY_CLIENT_SECRET);
-      fd.append("refresh_token", cfg.refreshToken);
-      fd.append("grant_type", "refresh_token");
-      const resp = await req("POST", "/v2/oauth/token", fd, fd.getHeaders());
-      if (!resp.success) {
-        log("error", `Legacy token refresh failed: ${resp.error.message}`);
-        return null;
-      }
+  return { getDevices, activate };
+}
+
+async function refresh(cfg, api) {
+  const tokens = resolveTokens(cfg, api);
+  api.log("debug", "Refreshing Bold access token...");
+
+  if (cfg.legacyAuthentication) {
+    const fd = new FormData();
+    fd.append("client_id", LEGACY_CLIENT_ID);
+    fd.append("client_secret", LEGACY_CLIENT_SECRET);
+    fd.append("refresh_token", tokens.refreshToken);
+    fd.append("grant_type", "refresh_token");
+    const resp = await axios.post(`${API_BASE}/v2/oauth/token`, fd, { headers: fd.getHeaders() });
+    if (resp.data.access_token) {
       return { accessToken: resp.data.access_token, refreshToken: resp.data.refresh_token };
     }
-
-    try {
-      const resp = await axios.post(cfg.refreshURL || DEFAULT_REFRESH_URL, { refreshToken: cfg.refreshToken });
-      const { accessToken, refreshToken } = resp.data.data;
-      if (!accessToken || !refreshToken) {
-        log("error", `Invalid refresh response: ${JSON.stringify(resp.data)}`);
-        return null;
-      }
-      return { accessToken, refreshToken };
-    } catch (err) {
-      log("error", `Token refresh error: ${err.message}`);
-      return null;
-    }
+    api.log("error", `Legacy token refresh failed: ${JSON.stringify(resp.data)}`);
+    return null;
   }
 
-  return { getDevices, activate, refresh };
+  try {
+    const resp = await axios.post(cfg.refreshURL || DEFAULT_REFRESH_URL, { refreshToken: tokens.refreshToken });
+    const { accessToken, refreshToken } = resp.data.data;
+    if (!accessToken || !refreshToken) {
+      api.log("error", `Invalid refresh response: ${JSON.stringify(resp.data)}`);
+      return null;
+    }
+    return { accessToken, refreshToken };
+  } catch (err) {
+    api.log("error", `Token refresh error: ${err.message}`);
+    return null;
+  }
 }
 
 async function syncDevices(cfg, api) {
   try {
-    const tokens = await bold.refresh();
+    const tokens = await refresh(cfg, api);
     if (tokens) {
       cfg.accessToken = tokens.accessToken;
       cfg.refreshToken = tokens.refreshToken;
@@ -113,7 +138,7 @@ async function syncDevices(cfg, api) {
   try {
     remoteDevices = await bold.getDevices();
   } catch (e) {
-    api.log("error", `Device sync failed: ${e.message}. Check that accessToken and refreshToken are valid.`);
+    api.log("error", `Device sync failed: ${e.message}. Check that authentication is valid.`);
     return;
   }
 
@@ -126,7 +151,6 @@ async function syncDevices(cfg, api) {
   const seen = new Set();
 
   for (const d of remoteDevices) {
-    // DeviceType: Lock=1, Connect=2. Connect hub is shown as switch by default.
     const isSwitch = d.type?.id === 2 && !cfg.showControllerAsLock;
     const did = isSwitch ? `bold-switch-${d.id}` : `bold-lock-${d.id}`;
     seen.add(did);
@@ -167,8 +191,7 @@ async function syncDevices(cfg, api) {
 
 module.exports = {
   start(cfg, api) {
-    const log = (level, msg) => api.log(level, msg);
-    bold = createBoldAPI(cfg, log);
+    bold = createBoldAPI(cfg, api);
 
     api.onCommand((deviceId, key, value) => {
       for (const [did, state] of devices) {
