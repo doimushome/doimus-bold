@@ -4,13 +4,15 @@ const axios = require("axios");
 const FormData = require("form-data");
 
 const API_BASE = "https://api.boldsmartlock.com";
-const DEFAULT_REFRESH_URL = "https://bold.nienhuisdevelopment.com/oauth/refresh";
+const DEFAULT_REFRESH_URL =
+  "https://bold.nienhuisdevelopment.com/oauth/refresh";
 const LEGACY_CLIENT_ID = "BoldApp";
 const LEGACY_CLIENT_SECRET = process.env.BOLD_CLIENT_SECRET || "";
 
 let bold = null;
 let devices = new Map();
 let refreshTimer = null;
+let savedApi = null;
 
 /**
  * Resolve access + refresh tokens from OAuth SDK first, then fall back to config.
@@ -18,7 +20,8 @@ let refreshTimer = null;
  */
 function resolveTokens(cfg, api) {
   // Try OAuth tokens from hub-injected SDK first (AUTH-01)
-  const oauth = typeof api.getOAuthToken === "function" ? api.getOAuthToken() : null;
+  const oauth =
+    typeof api.getOAuthToken === "function" ? api.getOAuthToken() : null;
   if (oauth && oauth.access_token) {
     return {
       accessToken: oauth.access_token,
@@ -47,12 +50,22 @@ function createBoldAPI(cfg, api) {
         data: body,
       });
       if (resp.data.errorCode && resp.data.errorCode !== "OK") {
-        return { success: false, error: { code: resp.data.errorCode, message: resp.data.errorMessage } };
+        return {
+          success: false,
+          error: { code: resp.data.errorCode, message: resp.data.errorMessage },
+        };
       }
       return { success: true, data: resp.data };
     } catch (err) {
       if (axios.isAxiosError(err)) {
-        return { success: false, error: { code: err.response?.data?.errorCode || err.response?.status || err.code, message: err.response?.data?.errorMessage || `${err}` } };
+        return {
+          success: false,
+          error: {
+            code:
+              err.response?.data?.errorCode || err.response?.status || err.code,
+            message: err.response?.data?.errorMessage || `${err}`,
+          },
+        };
       }
       return { success: false, error: { message: `${err}` } };
     }
@@ -62,8 +75,11 @@ function createBoldAPI(cfg, api) {
     api.log("debug", "Fetching Bold devices...");
     const resp = await req("GET", "/v1/effective-device-permissions");
     if (!resp.success) throw new Error(`getDevices: ${resp.error.message}`);
-    if (!Array.isArray(resp.data)) throw new Error("Unexpected /v1/effective-device-permissions format");
-    return resp.data.filter((d) => d.id && d.name && d.featureSet?.isActivatable && d.gateway);
+    if (!Array.isArray(resp.data))
+      throw new Error("Unexpected /v1/effective-device-permissions format");
+    return resp.data.filter(
+      (d) => d.id && d.name && d.featureSet?.isActivatable && d.gateway,
+    );
   }
 
   async function activate(deviceId) {
@@ -80,7 +96,10 @@ function createBoldAPI(cfg, api) {
       return false;
     }
     if (!resp.success) {
-      api.log("error", `Activation failed for ${deviceId}: ${resp.error.message}`);
+      api.log(
+        "error",
+        `Activation failed for ${deviceId}: ${resp.error.message}`,
+      );
       return false;
     }
     return true;
@@ -99,9 +118,14 @@ async function refresh(cfg, api) {
     fd.append("client_secret", LEGACY_CLIENT_SECRET);
     fd.append("refresh_token", tokens.refreshToken);
     fd.append("grant_type", "refresh_token");
-    const resp = await axios.post(`${API_BASE}/v2/oauth/token`, fd, { headers: fd.getHeaders() });
+    const resp = await axios.post(`${API_BASE}/v2/oauth/token`, fd, {
+      headers: fd.getHeaders(),
+    });
     if (resp.data.access_token) {
-      return { accessToken: resp.data.access_token, refreshToken: resp.data.refresh_token };
+      return {
+        accessToken: resp.data.access_token,
+        refreshToken: resp.data.refresh_token,
+      };
     }
     const logSafe = { ...resp.data, access_token: "***", refresh_token: "***" };
     api.log("error", `Legacy token refresh failed: ${JSON.stringify(logSafe)}`);
@@ -109,10 +133,15 @@ async function refresh(cfg, api) {
   }
 
   try {
-    const resp = await axios.post(cfg.refreshURL || DEFAULT_REFRESH_URL, { refreshToken: tokens.refreshToken });
+    const resp = await axios.post(cfg.refreshURL || DEFAULT_REFRESH_URL, {
+      refreshToken: tokens.refreshToken,
+    });
     const { accessToken, refreshToken } = resp.data.data;
     if (!accessToken || !refreshToken) {
-      api.log("error", `Invalid refresh response: ${JSON.stringify(resp.data)}`);
+      api.log(
+        "error",
+        `Invalid refresh response: ${JSON.stringify(resp.data)}`,
+      );
       return null;
     }
     return { accessToken, refreshToken };
@@ -139,13 +168,19 @@ async function syncDevices(cfg, api) {
   try {
     remoteDevices = await bold.getDevices();
   } catch (e) {
-    api.log("error", `Device sync failed: ${e.message}. Check that authentication is valid.`);
+    api.log(
+      "error",
+      `Device sync failed: ${e.message}. Check that authentication is valid.`,
+    );
     return;
   }
 
   api.log("info", `Found ${remoteDevices.length} activatable Bold device(s)`);
   if (remoteDevices.length === 0) {
-    api.log("warn", "No activatable devices found. Ensure locks are linked to a Bold Connect hub.");
+    api.log(
+      "warn",
+      "No activatable devices found. Ensure locks are linked to a Bold Connect hub.",
+    );
     return;
   }
 
@@ -192,6 +227,7 @@ async function syncDevices(cfg, api) {
 
 module.exports = {
   start(cfg, api) {
+    savedApi = api;
     bold = createBoldAPI(cfg, api);
 
     api.onCommand((deviceId, key, value) => {
@@ -204,7 +240,10 @@ module.exports = {
             bold.activate(state.device.id).then((ok) => {
               if (ok) {
                 api.updateDeviceState(did, { on: true });
-                setTimeout(() => api.updateDeviceState(did, { on: false }), state.device.settings.activationTime * 1000);
+                setTimeout(
+                  () => api.updateDeviceState(did, { on: false }),
+                  state.device.settings.activationTime * 1000,
+                );
               }
             });
           }
@@ -230,9 +269,22 @@ module.exports = {
       }
     });
 
-    syncDevices(cfg, api).catch((e) => api.log("error", `Initial sync error: ${e.message}`));
-    refreshTimer = setInterval(() => syncDevices(cfg, api).catch((e) => api.log("error", `Periodic sync error: ${e.message}`)), 24 * 60 * 60 * 1000);
+    syncDevices(cfg, api).catch((e) =>
+      api.log("error", `Initial sync error: ${e.message}`),
+    );
+    refreshTimer = setInterval(
+      () =>
+        syncDevices(cfg, api).catch((e) =>
+          api.log("error", `Periodic sync error: ${e.message}`),
+        ),
+      24 * 60 * 60 * 1000,
+    );
     if (refreshTimer.unref) refreshTimer.unref();
+  },
+
+  setConfig(cfg) {
+    this.stop();
+    this.start(cfg, savedApi);
   },
 
   stop() {
